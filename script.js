@@ -18,6 +18,7 @@ const tokensInput = document.getElementById('tokens');
 const guildInput = document.getElementById('guildId');
 const channelInput = document.getElementById('channelIds');
 const messageFileInput = document.getElementById('messageFile');
+const messageTextInput = document.getElementById('messageText');
 const randomizeCheckbox = document.getElementById('randomize');
 const allmentionCheckbox = document.getElementById('allmention');
 const delayInput = document.getElementById('delay');
@@ -30,6 +31,7 @@ const fetchMentionsBtn = document.getElementById('fetchMentions');
 const submitBtn = document.getElementById('submitBtn');
 const stopBtn = document.getElementById('stopSpam');
 const leaveBtn = document.getElementById('leaveBtn');
+const autoVoteBtn = document.getElementById('autoVoteBtn');
 const form = document.getElementById('form');
 
 // 言語オプションのチェックボックス
@@ -117,6 +119,23 @@ function generateRandomLanguageText() {
     return randomText;
 }
 
+// メッセージ入力タイプを取得
+function getMessageInputType() {
+    const fileOption = document.querySelector('.message-option-btn[data-option="file"]');
+    return fileOption.classList.contains('active') ? 'file' : 'text';
+}
+
+// メッセージ内容を取得
+function getMessageContent() {
+    const inputType = getMessageInputType();
+    
+    if (inputType === 'file') {
+        return messageContent;
+    } else {
+        return messageTextInput.value;
+    }
+}
+
 async function leaveGuild(token, guildId) {
     const response = await fetch(`https://discord.com/api/v9/users/@me/guilds/${guildId}`, {
         'method': 'DELETE',
@@ -149,6 +168,13 @@ messageFileInput.addEventListener('change', function(e) {
         reader.readAsText(file);
     }
 });
+
+// テキスト入力処理
+if (messageTextInput) {
+    messageTextInput.addEventListener('input', function() {
+        checkFormValidity();
+    });
+}
 
 autoFillBtn.addEventListener('click', async () => {
     clearLog();
@@ -333,6 +359,49 @@ async function sendMessage(token, channelId, message, options = {}) {
     return response;
 }
 
+// 自動投票機能
+async function autoVote(token, messageId, channelId, answerId = 0) {
+    const headers = {
+        'Authorization': token,
+        'Content-Type': 'application/json',
+        'x-super-properties': x_super_properties
+    };
+    
+    const payload = {
+        'answer_ids': [answerId]
+    };
+    
+    const response = await fetch(`https://discord.com/api/v9/channels/${channelId}/polls/${messageId}/answers`, {
+        'method': 'POST',
+        'headers': headers,
+        'body': JSON.stringify(payload),
+        'referrerPolicy': 'no-referrer'
+    });
+    
+    return response;
+}
+
+// メッセージ取得機能
+async function getMessages(token, channelId, limit = 50) {
+    const headers = {
+        'Authorization': token,
+        'Content-Type': 'application/json',
+        'x-super-properties': x_super_properties
+    };
+    
+    const response = await fetch(`https://discord.com/api/v9/channels/${channelId}/messages?limit=${limit}`, {
+        'method': 'GET',
+        'headers': headers,
+        'referrerPolicy': 'no-referrer'
+    });
+    
+    if (response.ok) {
+        return await response.json();
+    } else {
+        throw new Error(`メッセージ取得失敗: ${response.status}`);
+    }
+}
+
 async function sendMessageWithRetry(token, channelId, message, options = {}, maxRetries = 5, baseDelay = 3000) {
     let retryCount = 0;
     
@@ -375,20 +444,33 @@ async function sendMessageWithRetry(token, channelId, message, options = {}, max
 function checkFormValidity() {
     const hasTokens = tokensInput.value.trim();
     const hasGuildId = guildInput.value.trim();
-    const hasMessage = messageContent.trim();
+    
+    const inputType = getMessageInputType();
+    let hasMessage = false;
+    
+    if (inputType === 'file') {
+        hasMessage = messageContent.trim();
+    } else {
+        hasMessage = messageTextInput.value.trim();
+    }
+    
     submitBtn.disabled = !(hasTokens && hasGuildId && hasMessage);
 }
 
 tokensInput.addEventListener('input', checkFormValidity);
 guildInput.addEventListener('input', checkFormValidity);
 messageFileInput.addEventListener('change', checkFormValidity);
+if (messageTextInput) {
+    messageTextInput.addEventListener('input', checkFormValidity);
+}
 checkFormValidity();
 
 form.addEventListener('submit', async event => {
     event.preventDefault();
     
-    if (!messageContent) {
-        appendLog('⚠️ メッセージファイルを選択してください');
+    const message = getMessageContent();
+    if (!message.trim()) {
+        appendLog('⚠️ メッセージを入力またはファイルを選択してください');
         return;
     }
     
@@ -426,7 +508,7 @@ form.addEventListener('submit', async event => {
                 const success = await sendMessageWithRetry(
                     token, 
                     channelId, 
-                    messageContent,
+                    message,
                     {
                         'randomize': randomize,
                         'randomMentions': mentions,
@@ -486,3 +568,59 @@ leaveBtn.addEventListener('click', async () => {
     submitBtn.classList.remove('loading');
     submitBtn.textContent = '実行';
 });
+
+// 自動投票機能の実装
+if (autoVoteBtn) {
+    autoVoteBtn.addEventListener('click', async () => {
+        clearLog();
+        const tokens = parseList(tokensInput.value);
+        const channels = parseList(channelInput.value);
+        
+        if (!tokens.length) return appendLog('⚠️ トークンを入力してください');
+        if (!channels.length) return appendLog('⚠️ チャンネルIDを入力してください');
+        
+        autoVoteBtn.disabled = true;
+        autoVoteBtn.classList.add('loading');
+        autoVoteBtn.textContent = '投票中...';
+        
+        try {
+            for (const token of tokens) {
+                for (const channelId of channels) {
+                    try {
+                        // 最新のメッセージを取得
+                        const messages = await getMessages(token, channelId, 10);
+                        
+                        // 投票可能なメッセージを探す
+                        const pollMessages = messages.filter(msg => msg.poll && !msg.poll.expired);
+                        
+                        if (pollMessages.length === 0) {
+                            appendLog('ℹ️  ' + token.slice(0, 10) + '***** - 投票可能なメッセージが見つかりません');
+                            continue;
+                        }
+                        
+                        // 一番上の選択肢（0番）に投票
+                        for (const pollMsg of pollMessages) {
+                            const response = await autoVote(token, pollMsg.id, channelId, 0);
+                            
+                            if (response.ok) {
+                                appendLog('✅ ' + token.slice(0, 10) + '***** - 投票成功 (選択肢 0)');
+                            } else {
+                                appendLog('❌ ' + token.slice(0, 10) + '***** - 投票失敗: ' + response.status);
+                            }
+                            
+                            // 少し待機してから次の投票
+                            await sleep(1000);
+                        }
+                    } catch (error) {
+                        appendLog('❌ ' + token.slice(0, 10) + '***** - エラー: ' + error.message);
+                    }
+                }
+            }
+        } finally {
+            autoVoteBtn.disabled = false;
+            autoVoteBtn.classList.remove('loading');
+            autoVoteBtn.textContent = '自動投票（一番上の選択肢）';
+            appendLog('✅ 自動投票完了');
+        }
+    });
+}
